@@ -1,30 +1,293 @@
-name: Build Android APK
+name: Build Hybrid AI APK
+
 on:
   workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (debug or release)'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+      clean_build:
+        description: 'Clean build (removes cache)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  APK_NAME: hybridai
+  PYTHON_VERSION: '3.11'
 
 jobs:
-  build:
+  build-android:
+    name: Build APK (${{ github.event.inputs.build_type }})
     runs-on: ubuntu-latest
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Free Disk Space
+      # ─────────────────────────────────────────────
+      # STEP 1: FREE DISK SPACE (CRITICAL)
+      # MediaPipe C++ compilation + Android SDK/NDK
+      # requires 30GB+. Default runners have ~14GB free.
+      # This step reclaims ~28GB by removing unused tools.
+      # ─────────────────────────────────────────────
+      - name: "🧹 Free Disk Space (Critical for MediaPipe)"
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
-          android: false 
+          android: false        # Keep Android tools, we need SDK
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
 
-      - name: Build with Buildozer
-        uses: ArtemSBulgakov/buildozer-action-v1
-        id: buildozer
+      - name: "📊 Check Available Disk Space (Post-Cleanup)"
+        run: |
+          echo "=== Disk Space After Cleanup ==="
+          df -h /
+          echo ""
+          echo "=== Memory Info ==="
+          free -h
+          echo ""
+          echo "Available space must be >25GB for MediaPipe build"
+
+      # ─────────────────────────────────────────────
+      # STEP 2: CHECKOUT CODE
+      # ─────────────────────────────────────────────
+      - name: "📥 Checkout Repository"
+        uses: actions/checkout@v4
         with:
-          command: buildozer android debug
-          buildozer_version: master
+          fetch-depth: 1
 
-      - name: Upload APK
+      # ─────────────────────────────────────────────
+      # STEP 3: SET UP PYTHON
+      # ─────────────────────────────────────────────
+      - name: "🐍 Set up Python ${{ env.PYTHON_VERSION }}"
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # ─────────────────────────────────────────────
+      # STEP 4: INSTALL SYSTEM DEPENDENCIES
+      # ─────────────────────────────────────────────
+      - name: "📦 Install System Dependencies"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential \
+            git \
+            zip \
+            unzip \
+            python3-pip \
+            python3-setuptools \
+            python3-venv \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            cmake \
+            ninja-build \
+            libffi-dev \
+            libssl-dev \
+            liblzma-dev \
+            zlib1g-dev \
+            libncurses5-dev \
+            libncursesw5-dev \
+            libbz2-dev \
+            libreadline-dev \
+            libsqlite3-dev \
+            wget \
+            curl \
+            llvm \
+            libxml2-dev \
+            libxslt1-dev \
+            tk-dev \
+            lzma \
+            openjdk-17-jdk \
+            ccache
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
+
+      # ─────────────────────────────────────────────
+      # STEP 5: INSTALL PYTHON BUILD TOOLS
+      # ─────────────────────────────────────────────
+      - name: "🔧 Install Buildozer and Dependencies"
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install --upgrade buildozer cython==3.0.10 virtualenv
+          pip install --upgrade python-for-android
+
+      # ─────────────────────────────────────────────
+      # STEP 6: CONFIGURE ANDROID SDK/NDK CACHE
+      # ─────────────────────────────────────────────
+      - name: "💾 Cache Android SDK/NDK & Buildozer"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer/android/platform/android-sdk
+            ~/.buildozer/android/platform/android-ndk*
+            ~/.buildozer/android/platform/build-tools
+            .buildozer
+          key: buildozer-${{ runner.os }}-ndk25b-api34-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-ndk25b-api34-
+            buildozer-${{ runner.os }}-
+
+      # ─────────────────────────────────────────────
+      # STEP 7: CLEAN BUILD (OPTIONAL)
+      # ─────────────────────────────────────────────
+      - name: "🗑️ Clean Previous Build (if requested)"
+        if: ${{ github.event.inputs.clean_build == 'true' }}
+        run: |
+          echo "Cleaning previous build artifacts..."
+          rm -rf .buildozer/android/platform/build-arm64-v8a
+          rm -rf .buildozer/android/app
+          rm -rf bin/
+          echo "Clean complete."
+
+      # ─────────────────────────────────────────────
+      # STEP 8: ACCEPT ANDROID SDK LICENSES
+      # ─────────────────────────────────────────────
+      - name: "📜 Pre-Accept Android SDK Licenses"
+        run: |
+          mkdir -p ~/.buildozer/android/platform/android-sdk/licenses
+          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > ~/.buildozer/android/platform/android-sdk/licenses/android-sdk-license
+          echo "84831b9409646a918e30573bab4c9c91346d8abd" >> ~/.buildozer/android/platform/android-sdk/licenses/android-sdk-license
+          echo "d56f5187479451eabf01fb78af6dfcb131a6481e" >> ~/.buildozer/android/platform/android-sdk/licenses/android-sdk-license
+          echo "e6b7c2ab7fa2298c15165e9583d0acf0b04a2232" > ~/.buildozer/android/platform/android-sdk/licenses/android-sdk-arm-dbt-license
+
+      # ─────────────────────────────────────────────
+      # STEP 9: CONFIGURE SWAP FOR HEAVY BUILD
+      # ─────────────────────────────────────────────
+      - name: "🔄 Configure Additional Swap Space"
+        run: |
+          sudo fallocate -l 8G /swapfile2
+          sudo chmod 600 /swapfile2
+          sudo mkswap /swapfile2
+          sudo swapon /swapfile2
+          echo "=== Swap Info ==="
+          sudo swapon --show
+          free -h
+
+      # ─────────────────────────────────────────────
+      # STEP 10: VALIDATE BUILDOZER.SPEC
+      # ─────────────────────────────────────────────
+      - name: "✅ Validate buildozer.spec"
+        run: |
+          echo "=== Validating buildozer.spec ==="
+          if ! grep -q "android.archs = arm64-v8a" buildozer.spec; then
+            echo "❌ ERROR: android.archs must be set to arm64-v8a ONLY"
+            echo "MediaPipe does NOT support armeabi-v7a (32-bit)"
+            exit 1
+          fi
+          if grep -q "armeabi-v7a" buildozer.spec; then
+            echo "❌ ERROR: Found armeabi-v7a in buildozer.spec"
+            echo "MediaPipe WILL fail to link against 32-bit libraries"
+            exit 1
+          fi
+          echo "✅ Architecture validation passed: arm64-v8a only"
+          echo ""
+          grep "android.api" buildozer.spec
+          grep "android.minapi" buildozer.spec
+          grep "android.archs" buildozer.spec
+          grep "requirements" buildozer.spec | head -1
+          echo ""
+          echo "✅ buildozer.spec validation complete"
+
+      # ─────────────────────────────────────────────
+      # STEP 11: BUILD THE APK
+      # ─────────────────────────────────────────────
+      - name: "🔨 Build APK with Buildozer"
+        run: |
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          export PATH=$JAVA_HOME/bin:$PATH
+          export ANDROIDSDK=$HOME/.buildozer/android/platform/android-sdk
+          export ANDROIDNDK=$HOME/.buildozer/android/platform/android-ndk-r25b
+          export ANDROIDAPI=34
+          export NDKAPI=26
+
+          # Set ccache for faster rebuilds
+          export USE_CCACHE=1
+          export CCACHE_DIR=$HOME/.ccache
+
+          echo "=== Build Environment ==="
+          echo "JAVA_HOME: $JAVA_HOME"
+          java -version
+          python --version
+          echo "Buildozer version: $(buildozer version 2>/dev/null || echo 'checking during build')"
+          echo ""
+
+          # Run the build
+          if [ "${{ github.event.inputs.build_type }}" == "release" ]; then
+            echo "Building RELEASE APK..."
+            buildozer -v android release 2>&1 | tee build.log
+          else
+            echo "Building DEBUG APK..."
+            buildozer -v android debug 2>&1 | tee build.log
+          fi
+
+      # ─────────────────────────────────────────────
+      # STEP 12: VERIFY BUILD OUTPUT
+      # ─────────────────────────────────────────────
+      - name: "🔍 Verify APK Output"
+        run: |
+          echo "=== Searching for APK files ==="
+          find . -name "*.apk" -type f 2>/dev/null
+          echo ""
+          if ls bin/*.apk 1>/dev/null 2>&1; then
+            echo "✅ APK found!"
+            ls -lh bin/*.apk
+            echo ""
+            # Verify it's arm64-v8a only
+            echo "=== APK Architecture Verification ==="
+            for apk in bin/*.apk; do
+              unzip -l "$apk" | grep "\.so" | head -20
+            done
+          else
+            echo "❌ No APK found in bin/"
+            echo ""
+            echo "=== Last 100 lines of build log ==="
+            tail -100 build.log
+            exit 1
+          fi
+
+      # ─────────────────────────────────────────────
+      # STEP 13: UPLOAD APK ARTIFACT
+      # ─────────────────────────────────────────────
+      - name: "📤 Upload APK Artifact"
         uses: actions/upload-artifact@v4
         with:
-          name: PocoGemma-APK
+          name: "${{ env.APK_NAME }}-${{ github.event.inputs.build_type }}-arm64-v8a"
           path: bin/*.apk
+          retention-days: 14
+          if-no-files-found: error
+
+      # ─────────────────────────────────────────────
+      # STEP 14: UPLOAD BUILD LOG (ON FAILURE)
+      # ─────────────────────────────────────────────
+      - name: "📋 Upload Build Log (on failure)"
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-log
+          path: |
+            build.log
+            .buildozer/android/platform/build-arm64-v8a/**/*.log
+          retention-days: 7
+          if-no-files-found: warn
+
+      # ─────────────────────────────────────────────
+      # STEP 15: FINAL DISK SPACE REPORT
+      # ─────────────────────────────────────────────
+      - name: "📊 Final Disk Space Report"
+        if: always()
+        run: |
+          echo "=== Final Disk Usage ==="
+          df -h /
+          echo ""
+          echo "=== Buildozer Cache Size ==="
+          du -sh .buildozer/ 2>/dev/null || echo "No cache"
+          du -sh ~/.buildozer/ 2>/dev/null || echo "No home cache"
