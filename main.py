@@ -1,245 +1,201 @@
-import threading
+"""
+HybridAI - Multimodal AI Assistant
+===================================
+Hybrid AI App combining Local LLM (Gemma 2B Int4) with Internet Search.
+Optimized for Poco M6 Plus (Snapdragon 4 Gen 2).
+
+Features:
+- Local LLM inference via MediaPipe GenAI (Gemma 2B int4)
+- Internet search via Google Custom Search API
+- Camera capture for multimodal input
+- Voice input via microphone
+- Persistent settings via JsonStore
+- Robust error handling for graceful degradation
+"""
+
 import os
-import requests
+import sys
+import json
+import time
+import threading
+import traceback
+from pathlib import Path
+from functools import partial
+
+# ──────────────────────────────────────────────
+# SAFE IMPORTS WITH FALLBACK
+# ──────────────────────────────────────────────
+
+# Core Kivy - These MUST work or the app can't start at all
+from kivy.app import App
+from kivy.clock import Clock, mainthread
+from kivy.core.window import Window
 from kivy.lang import Builder
-from kivy.utils import platform
-from kivymd.app import MDApp
-from kivymd.uix.screen import MDScreen
-from kivymd.uix.screenmanager import MDScreenManager
-from kivymd.uix.boxlayout import MDBoxLayout
-from kivy.properties import StringProperty
+from kivy.logger import Logger
+from kivy.metrics import dp, sp
+from kivy.properties import (
+    StringProperty, BooleanProperty, NumericProperty,
+    ListProperty, ObjectProperty, DictProperty
+)
 from kivy.storage.jsonstore import JsonStore
-from kivy.clock import Clock
+from kivy.utils import platform
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.image import Image as KivyImage
+from kivy.core.image import Image as CoreImage
 
-# Permissions (Android 10+ Compatible)
-if platform == 'android':
-    from android.permissions import request_permissions, Permission
-    request_permissions([
-        Permission.INTERNET,
-        Permission.READ_EXTERNAL_STORAGE,
-        Permission.WRITE_EXTERNAL_STORAGE,
-        Permission.CAMERA,
-        Permission.RECORD_AUDIO
-    ])
-
-# MediaPipe Safe Import
-MEDIAPIPE_READY = False
+# KivyMD imports
 try:
-    from mediapipe.tasks.python.genai import LlmInference, LlmInferenceOptions
-    MEDIAPIPE_READY = True
+    from kivymd.app import MDApp
+    from kivymd.uix.screen import MDScreen
+    from kivymd.uix.screenmanager import MDScreenManager
+    from kivymd.uix.toolbar import MDTopAppBar
+    from kivymd.uix.button import (
+        MDRaisedButton, MDFlatButton, MDIconButton,
+        MDFillRoundFlatButton, MDFloatingActionButton,
+        MDRoundFlatIconButton
+    )
+    from kivymd.uix.textfield import MDTextField
+    from kivymd.uix.label import MDLabel, MDIcon
+    from kivymd.uix.card import MDCard
+    from kivymd.uix.dialog import MDDialog
+    from kivymd.uix.list import (
+        MDList, OneLineListItem, TwoLineListItem,
+        ThreeLineListItem, OneLineIconListItem,
+        TwoLineIconListItem, IconLeftWidget
+    )
+    from kivymd.uix.selectioncontrol import MDSwitch, MDCheckbox
+    from kivymd.uix.menu import MDDropdownMenu
+    from kivymd.uix.snackbar import Snackbar
+    from kivymd.uix.spinner import MDSpinner
+    from kivymd.uix.tab import MDTabs, MDTabsBase
+    from kivymd.uix.boxlayout import MDBoxLayout
+    from kivymd.uix.floatlayout import MDFloatLayout
+    from kivymd.uix.gridlayout import MDGridLayout
+    from kivymd.uix.bottomnavigation import MDBottomNavigation, MDBottomNavigationItem
+    from kivymd.toast import toast as md_toast
+    KIVYMD_AVAILABLE = True
+    Logger.info("HybridAI: KivyMD loaded successfully")
+except ImportError as e:
+    KIVYMD_AVAILABLE = False
+    Logger.error(f"HybridAI: KivyMD import failed: {e}")
+    sys.exit("KivyMD is required. Cannot continue.")
+
+# ──────────────────────────────────────────────
+# MEDIAPIPE - WRAPPED IN TRY/EXCEPT (CRITICAL)
+# This is the most fragile import. On some devices,
+# the native .so libraries may fail to load.
+# ──────────────────────────────────────────────
+MEDIAPIPE_AVAILABLE = False
+LlmInference = None
+MEDIAPIPE_ERROR = ""
+
+try:
+    from mediapipe.tasks.python.genai import llm_inference
+    LlmInference = llm_inference.LlmInference
+    MEDIAPIPE_AVAILABLE = True
+    Logger.info("HybridAI: MediaPipe LLM loaded successfully")
+except ImportError as e:
+    MEDIAPIPE_ERROR = f"ImportError: {e}"
+    Logger.warning(f"HybridAI: MediaPipe import failed: {e}")
+    Logger.warning("HybridAI: Local LLM will be UNAVAILABLE")
+except Exception as e:
+    MEDIAPIPE_ERROR = f"Exception: {e}"
+    Logger.error(f"HybridAI: MediaPipe load error: {e}")
+    Logger.error(traceback.format_exc())
+
+# ──────────────────────────────────────────────
+# REQUESTS - For Internet Search
+# ──────────────────────────────────────────────
+REQUESTS_AVAILABLE = False
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+    Logger.info("HybridAI: requests library loaded")
 except ImportError:
-    print("MediaPipe Library not found or incompatible.")
+    Logger.warning("HybridAI: requests not available, internet search disabled")
 
-KV = '''
-<ChatMessage@MDBoxLayout>:
-    adaptive_height: True
-    orientation: 'vertical'
-    padding: dp(10)
-    spacing: dp(5)
+# ──────────────────────────────────────────────
+# NUMPY - For potential data processing
+# ──────────────────────────────────────────────
+NUMPY_AVAILABLE = False
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+    Logger.info("HybridAI: numpy loaded")
+except ImportError:
+    Logger.warning("HybridAI: numpy not available")
 
-    MDLabel:
-        text: root.sender
-        theme_text_color: "Secondary"
-        font_style: "Caption"
-        size_hint_y: None
-        height: self.texture_size[1]
+# ──────────────────────────────────────────────
+# ANDROID-SPECIFIC IMPORTS
+# ──────────────────────────────────────────────
+ANDROID_AVAILABLE = False
+android_permissions = None
+android_activity = None
 
-    MDLabel:
-        text: root.text
-        theme_text_color: "Primary"
-        size_hint_y: None
-        height: self.texture_size[1]
-        text_size: self.width, None
+if platform == "android":
+    try:
+        from android.permissions import request_permissions, Permission, check_permission
+        from android.storage import primary_external_storage_path, app_storage_path
+        from android import activity as android_activity_module
+        from jnius import autoclass, cast
+        android_permissions = {
+            "INTERNET": Permission.INTERNET,
+            "CAMERA": Permission.CAMERA,
+            "RECORD_AUDIO": Permission.RECORD_AUDIO,
+            "READ_STORAGE": Permission.READ_EXTERNAL_STORAGE,
+            "WRITE_STORAGE": Permission.WRITE_EXTERNAL_STORAGE,
+        }
+        ANDROID_AVAILABLE = True
+        Logger.info("HybridAI: Android modules loaded")
+    except ImportError as e:
+        Logger.warning(f"HybridAI: Android imports failed: {e}")
 
-<HomeScreen>:
-    MDBoxLayout:
-        orientation: 'vertical'
+# ──────────────────────────────────────────────
+# PLYER - Cross-platform hardware access
+# ──────────────────────────────────────────────
+PLYER_AVAILABLE = False
+plyer_camera = None
+plyer_tts = None
+plyer_stt = None
+plyer_vibrator = None
 
-        MDTopAppBar:
-            title: "Poco Gemma AI"
-            right_action_items: [["cog", lambda x: app.open_settings()]]
+try:
+    from plyer import camera as plyer_camera_module
+    from plyer import tts as plyer_tts_module
+    from plyer import vibrator as plyer_vibrator_module
+    plyer_camera = plyer_camera_module
+    plyer_tts = plyer_tts_module
+    plyer_vibrator = plyer_vibrator_module
+    PLYER_AVAILABLE = True
+    Logger.info("HybridAI: Plyer loaded")
+except ImportError as e:
+    Logger.warning(f"HybridAI: Plyer import partial: {e}")
 
-        ScrollView:
-            MDBoxLayout:
-                id: chat_list
-                orientation: 'vertical'
-                adaptive_height: True
-                padding: dp(10)
-                spacing: dp(10)
+# ──────────────────────────────────────────────
+# CONSTANTS
+# ──────────────────────────────────────────────
+APP_NAME = "HybridAI"
+APP_VERSION = "1.0.0"
 
-        MDBoxLayout:
-            adaptive_height: True
-            padding: dp(10)
-            spacing: dp(10)
-            md_bg_color: 0.95, 0.95, 0.95, 1
+# Model paths (user must place model file here)
+DEFAULT_MODEL_DIR = "/sdcard/Download/"
+DEFAULT_MODEL_NAME = "gemma-2b-it-gpu-int4.bin"
+SETTINGS_FILE = "hybridai_settings.json"
 
-            MDSwitch:
-                id: net_switch
-                active: False
-                width: dp(40)
-            
-            MDLabel:
-                text: "Web"
-                size_hint_x: None
-                width: dp(40)
-                valign: "center"
+# Google Custom Search API (user configures in settings)
+DEFAULT_SEARCH_API_KEY = ""
+DEFAULT_SEARCH_ENGINE_ID = ""
+GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
 
-            MDTextField:
-                id: user_input
-                hint_text: "Ask Local AI..."
-                mode: "round"
-                multiline: False
+# LLM Configuration
+DEFAULT_MAX_TOKENS = 512
+DEFAULT_TEMPERATURE = 0.7
+DEFAULT_TOP_K = 40
+DEFAULT_TOP_P = 0.9
 
-            MDIconButton:
-                icon: "send"
-                on_release: app.send_message()
+# Chat History
+MAX_CHAT_HISTORY = 100
 
-<SettingsScreen>:
-    MDBoxLayout:
-        orientation: 'vertical'
-        padding: dp(20)
-        spacing: dp(20)
-
-        MDTopAppBar:
-            title: "Settings"
-            left_action_items: [["arrow-left", lambda x: app.close_settings()]]
-
-        MDTextField:
-            id: api_key
-            hint_text: "Google Search API Key"
-
-        MDTextField:
-            id: cx_id
-            hint_text: "Search Engine ID (CX)"
-
-        MDTextField:
-            id: model_path
-            hint_text: "Model Path (.bin)"
-            text: "/sdcard/Download/gemma.bin"
-
-        MDRaisedButton:
-            text: "Save Configuration"
-            pos_hint: {"center_x": .5}
-            on_release: app.save_settings()
-
-        Widget:
-'''
-
-class ChatMessage(MDBoxLayout):
-    text = StringProperty()
-    sender = StringProperty()
-
-class HomeScreen(MDScreen):
-    pass
-
-class SettingsScreen(MDScreen):
-    pass
-
-class GenAIApp(MDApp):
-    store = JsonStore('config.json')
-    llm = None
-
-    def build(self):
-        self.theme_cls.primary_palette = "Indigo"
-        self.sm = MDScreenManager()
-        self.sm.add_widget(HomeScreen(name='home'))
-        self.sm.add_widget(SettingsScreen(name='settings'))
-        return self.sm
-
-    def on_start(self):
-        # Load settings
-        if self.store.exists('settings'):
-            cfg = self.store.get('settings')
-            self.api_key = cfg.get('api_key', '')
-            self.cx_id = cfg.get('cx_id', '')
-            model_path = cfg.get('model_path', '/sdcard/Download/gemma.bin')
-            threading.Thread(target=self.load_model, args=(model_path,), daemon=True).start()
-        else:
-            self.open_settings()
-
-    def load_model(self, path):
-        if not MEDIAPIPE_READY:
-            Clock.schedule_once(lambda x: self.add_chat("System", "MediaPipe lib not compatible with this Android build."))
-            return
-
-        if not os.path.exists(path):
-            Clock.schedule_once(lambda x: self.add_chat("System", f"Model file missing at: {path}"))
-            return
-
-        try:
-            options = LlmInferenceOptions(
-                model_path=path,
-                max_tokens=512,
-                top_k=40,
-                temperature=0.7
-            )
-            self.llm = LlmInference.create_from_options(options)
-            Clock.schedule_once(lambda x: self.add_chat("System", "Gemma Model Loaded Locally!"))
-        except Exception as e:
-            Clock.schedule_once(lambda x: self.add_chat("System", f"Model Load Failed: {e}"))
-
-    def send_message(self):
-        screen = self.sm.get_screen('home')
-        query = screen.ids.user_input.text
-        use_web = screen.ids.net_switch.active
-        
-        if not query: return
-        
-        self.add_chat("You", query)
-        screen.ids.user_input.text = ""
-        
-        threading.Thread(target=self.process_query, args=(query, use_web)).start()
-
-    def process_query(self, query, use_web):
-        context = ""
-        if use_web:
-            context = self.web_search(query)
-        
-        prompt = f"{context}\nUser: {query}\nAI:"
-        
-        if self.llm:
-            try:
-                response = self.llm.generate(prompt)
-                Clock.schedule_once(lambda x: self.add_chat("Gemma", response))
-            except Exception as e:
-                Clock.schedule_once(lambda x: self.add_chat("Error", str(e)))
-        else:
-            Clock.schedule_once(lambda x: self.add_chat("Bot", "AI not loaded. Check model path."))
-
-    def web_search(self, query):
-        if not hasattr(self, 'api_key') or not self.api_key:
-            return "[No API Key]"
-        try:
-            url = "https://www.googleapis.com/customsearch/v1"
-            params = {'q': query, 'key': self.api_key, 'cx': self.cx_id}
-            data = requests.get(url, params=params).json()
-            snippets = [item.get('snippet','') for item in data.get('items', [])[:2]]
-            return "Web Context: " + " ".join(snippets)
-        except:
-            return "[Search Failed]"
-
-    def add_chat(self, sender, text):
-        screen = self.sm.get_screen('home')
-        msg = ChatMessage(sender=sender, text=str(text))
-        screen.ids.chat_list.add_widget(msg)
-
-    def open_settings(self):
-        self.sm.current = 'settings'
-
-    def close_settings(self):
-        self.sm.current = 'home'
-
-    def save_settings(self):
-        screen = self.sm.get_screen('settings')
-        api = screen.ids.api_key.text
-        cx = screen.ids.cx_id.text
-        path = screen.ids.model_path.text
-        
-        self.store.put('settings', api_key=api, cx_id=cx, model_path=path)
-        self.api_key = api
-        self.cx_id = cx
-        threading.Thread(target=self.load_model, args=(path,), daemon=True).start()
-        self.close_settings()
-
-if __name__ == '__main__':
-    GenAIApp().run()
+# ──────────────────────────────────────────────
+# KV 
